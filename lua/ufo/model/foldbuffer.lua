@@ -81,9 +81,6 @@ end
 function FoldBuffer:resetFoldedLines(clear)
     self.foldedLines = {}
     self.foldedLineCount = 0
-    for _ = 1, self:lineCount() do
-        table.insert(self.foldedLines, false)
-    end
     if clear then
         pcall(api.nvim_buf_clear_namespace, self.bufnr, self.ns, 0, -1)
     end
@@ -232,7 +229,11 @@ function FoldBuffer:closeFold(lnum, endLnum, virtText, namespaces)
     local fl = self.foldedLines[lnum]
     if not fl then
         if self.foldedLineCount == 0 and lineCount ~= #self.foldedLines then
-            self:resetFoldedLines()
+            local foldedLines = {}
+            for i = 1, lineCount do
+                foldedLines[i] = false
+            end
+            self.foldedLines = foldedLines
         end
         fl = foldedline:new(self.bufnr, self.ns)
         self.foldedLineCount = self.foldedLineCount + 1

@@ -21,10 +21,19 @@ end
 
 function Buffer:reload()
     self._changedtick = api.nvim_buf_get_changedtick(self.bufnr)
-    self._lines = {}
-    for _ = 1, api.nvim_buf_line_count(self.bufnr) do
-        table.insert(self._lines, false)
+    self._lines = nil
+end
+
+---@return table<number, string|boolean>
+function Buffer:ensureLines()
+    if not self._lines then
+        local lines = {}
+        for i = 1, api.nvim_buf_line_count(self.bufnr) do
+            lines[i] = false
+        end
+        self._lines = lines
     end
+    return self._lines
 end
 
 function Buffer:dispose()
@@ -55,7 +64,9 @@ function Buffer:attach()
                 return
             end
             self._changedtick = changedtick
-            self._lines = self:handleLinesChanged(self._lines, firstLine, lastLine, lastLineUpdated)
+            if self._lines then
+                self._lines = self:handleLinesChanged(self._lines, firstLine, lastLine, lastLineUpdated)
+            end
             event:emit('BufLinesChanged', bufnr, changedtick, firstLine, lastLine,
                 lastLineUpdated, byteCount)
         end,
@@ -217,7 +228,7 @@ function Buffer:lineCount()
     if self:buftype() == 'quickfix' then
         self:reload()
     end
-    return #self._lines
+    return self._lines and #self._lines or api.nvim_buf_line_count(self.bufnr)
 end
 
 ---@param lnum number
@@ -231,6 +242,7 @@ function Buffer:lines(lnum, endLnum)
     if endLnum < 0 then
         endLnum = lineCount + endLnum + 1
     end
+    self:ensureLines()
     for _, hunk in ipairs(self:buildMissingHunk(self._lines, lnum, endLnum)) do
         local hs, he = hunk[1], hunk[2]
         local lines = api.nvim_buf_get_lines(self.bufnr, hs - 1, he, true)
