@@ -1,6 +1,9 @@
+local promise = require('promise')
 local bufmanager = require('ufo.bufmanager')
 local foldingrange = require('ufo.model.foldingrange')
 local utils = require('ufo.utils')
+
+local api = vim.api
 
 ---@class UfoTreesitterProvider
 ---@field hasProviders table<string, boolean>
@@ -60,110 +63,94 @@ function MetaNode.from_nodes(startNode, endNode, nodeType)
     }, nodeType)
 end
 
-local function prepareQuery(bufnr, parser, root, rootLang, queryName)
-    if not root then
-        local firstTree = parser:trees()[1]
-        if firstTree then
-            root = firstTree:root()
-        else
-            return
-        end
+local makeRangePatternsCache = setmetatable({}, {__mode = 'k'})
+
+local function getMakeRangePatterns(q)
+    local res = makeRangePatternsCache[q]
+    if res then
+        return res
     end
-
-    local range = {root:range()}
-
-    if not rootLang then
-        local langTree = parser:language_for_range(range)
-        if langTree then
-            rootLang = langTree:lang()
-        else
-            return
-        end
-    end
-
-    return get_query(rootLang, queryName), {
-        root = root,
-        source = bufnr,
-        start = range[1],
-        -- The end row is exclusive so we need to add 1 to it.
-        stop = range[3] + 1,
-    }
-end
-
-local function getNodesType(nodes)
-    local node = utils.has11() and nodes[1] or nodes
-    return node.type and node:type() or nil
-end
-
-local function iterFoldMatches(bufnr, parser, root, rootLang)
-    local q, p = prepareQuery(bufnr, parser, root, rootLang, 'folds')
-    if not q then
-        return function() end
-    end
-    ---@diagnostic disable-next-line: need-check-nil
-    local iter = q:iter_matches(p.root, p.source, p.start, p.stop)
-    return function()
-        local pattern, match, metadata = iter()
-        local matches = {}
-        if pattern == nil then
-            return pattern
-        end
-
-        -- Extract capture names from each match
-        for id, nodes in pairs(match) do
-            local m = metadata[id]
-            local node, nType
-            if m and m.range then
-                nType = getNodesType(nodes)
-                node = MetaNode:new(m.range, nType)
-            elseif type(nodes) ~= 'table' then
-                -- old behaviou before 0.11
-                node = nodes
-            elseif #nodes == 1 then
-                node = nodes[1]
-            else
-                nType = getNodesType(nodes)
-                node = MetaNode.from_nodes(nodes[1], nodes[#nodes], nType)
-            end
-
-            table.insert(matches, node)
-        end
-
-        -- Add some predicates for testing
-        local preds = q.info.patterns[pattern]
-        if preds then
-            for _, pred in pairs(preds) do
-                if pred[1] == 'make-range!' and type(pred[2]) == 'string' and #pred == 4 then
-                    local node = MetaNode.from_nodes(match[pred[3]], match[pred[4]])
-                    table.insert(matches, node)
-                end
+    res = {}
+    for pattern, preds in pairs(q.info.patterns) do
+        for _, pred in pairs(preds) do
+            if pred[1] == 'make-range!' and type(pred[2]) == 'string' and #pred == 4 then
+                res[pattern] = res[pattern] or {}
+                table.insert(res[pattern], pred)
             end
         end
-        return matches
     end
-end
-
-local function getFoldMatches(res, bufnr, parser, root, lang)
-    for matches in iterFoldMatches(bufnr, parser, root, lang) do
-        for _, node in ipairs(matches) do
-            table.insert(res, node)
-        end
-    end
+    makeRangePatternsCache[q] = res
     return res
 end
 
-local function getCpatureMatchesRecursively(bufnr, parser)
-    local noQuery = true
-    local res = {}
+local function addRange(ranges, startRow, endRow, endCol, typeNode)
+    if endCol == 0 then
+        endRow = endRow - 1
+    end
+    if endRow > startRow then
+        local nType = typeNode and typeNode.type and typeNode:type() or nil
+        table.insert(ranges, foldingrange.new(startRow, endRow, nil, nil, nType))
+    end
+end
+
+local function collectFoldRanges(ranges, bufnr, root, lang)
+    local q = get_query(lang, 'folds')
+    if not q then
+        return
+    end
+    local makeRangePatterns = getMakeRangePatterns(q)
+    local startRow, _, endRow = root:range()
+    -- The end row is exclusive so we need to add 1 to it.
+    for pattern, match, metadata in q:iter_matches(root, bufnr, startRow, endRow + 1) do
+        for id, nodes in pairs(match) do
+            local first, last = nodes, nodes
+            if type(nodes) == 'table' then
+                first, last = nodes[1], nodes[#nodes]
+            end
+            local m = metadata[id]
+            if m and m.range then
+                addRange(ranges, m.range[1], m.range[3], m.range[4], first)
+            elseif first == last then
+                local sRow, _, eRow, eCol = first:range()
+                addRange(ranges, sRow, eRow, eCol, first)
+            else
+                local sRow = first:start()
+                local eRow, eCol = last:end_()
+                addRange(ranges, sRow, eRow, eCol, first)
+            end
+        end
+        local preds = makeRangePatterns[pattern]
+        if preds then
+            for _, pred in ipairs(preds) do
+                local node = MetaNode.from_nodes(match[pred[3]], match[pred[4]])
+                local sRow, _, eRow, eCol = node:range()
+                addRange(ranges, sRow, eRow, eCol, node)
+            end
+        end
+    end
+end
+
+local function getFoldRanges(bufnr, parser)
+    local hasQuery = false
+    local ranges = {}
     parser:for_each_tree(function(tree, langTree)
         local lang = langTree:lang()
-        local has_folds = #get_query_files(lang, 'folds', nil) > 0
-        if has_folds then
-            noQuery = false
-            getFoldMatches(res, bufnr, parser, tree:root(), lang)
+        if #get_query_files(lang, 'folds', nil) > 0 then
+            hasQuery = true
+            collectFoldRanges(ranges, bufnr, tree:root(), lang)
         end
     end)
-    return not noQuery, res
+    return hasQuery, ranges
+end
+
+local function getFoldsFromParser(bufnr, parser, ft)
+    local ok, ranges = getFoldRanges(bufnr, parser)
+    if not ok then
+        Treesitter.hasProviders[ft] = false
+        error('UfoFallbackException')
+    end
+    foldingrange.sortRanges(ranges)
+    return ranges
 end
 
 function Treesitter.getFolds(bufnr)
@@ -188,30 +175,27 @@ function Treesitter.getFolds(bufnr)
         self.hasProviders[ft] = false
         error('UfoFallbackException')
     end
-    if utils.has11() then
-        parser:parse()
+    if not utils.has11() then
+        return getFoldsFromParser(bufnr, parser, ft)
     end
-
-    local ranges = {}
-    local ok, matches = getCpatureMatchesRecursively(bufnr, parser)
-    if not ok then
-        self.hasProviders[ft] = false
-        error('UfoFallbackException')
-    end
-    for _, node in ipairs(matches) do
-        if node.range then
-            local start, _, stop, stop_col = node:range()
-            if stop_col == 0 then
-                stop = stop - 1
+    return promise(function(resolve, reject)
+        parser:parse(nil, function(err)
+            if err then
+                reject('UfoFallbackException')
+                return
             end
-            if stop > start then
-                local type = node.type and node:type() or nil
-                table.insert(ranges, foldingrange.new(start, stop, nil, nil, type))
+            if not api.nvim_buf_is_valid(bufnr) then
+                resolve()
+                return
             end
-        end
-    end
-    foldingrange.sortRanges(ranges)
-    return ranges
+            local ok, res = pcall(getFoldsFromParser, bufnr, parser, ft)
+            if ok then
+                resolve(res)
+            else
+                reject(res)
+            end
+        end)
+    end)
 end
 
 function Treesitter:dispose()
